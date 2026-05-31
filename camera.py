@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import time
 import wave
+import sys
 
 import cv2
 import pyaudio
@@ -24,10 +25,12 @@ from google.genai import types
 # Models / API config
 # =========================
 
-# Gemini Robotics-ER runs on this computer/Raspberry Pi, not on the Arduino.
-# If your account does not have access to this preview model, temporarily set this
-# to a model you can use, such as "gemini-2.5-flash".
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-robotics-er-1.6-preview")
+# Use a general Gemini model for conversation, transcription, classification,
+# and spoken responses.
+TEXT_MODEL = os.getenv("TEXT_MODEL", "gemini-3.5-flash")
+
+# Use Gemini Robotics-ER only for camera + robot movement reasoning.
+ROBOTICS_MODEL = os.getenv("ROBOTICS_MODEL", "gemini-robotics-er-1.6-preview")
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
@@ -39,8 +42,8 @@ ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
 # =========================
 
 # Set ARDUINO_PORT in your terminal before running, for example:
-#   macOS:  export ARDUINO_PORT=/dev/cu.usbmodem1101
-#   Linux:  export ARDUINO_PORT=/dev/ttyACM0
+#   macOS:   export ARDUINO_PORT=/dev/cu.usbmodem1101
+#   Linux:   export ARDUINO_PORT=/dev/ttyACM0
 #   Windows: set ARDUINO_PORT=COM3
 ARDUINO_PORT = os.getenv("ARDUINO_PORT", "")
 ARDUINO_BAUD = int(os.getenv("ARDUINO_BAUD", "9600"))
@@ -48,7 +51,7 @@ ARDUINO_BAUD = int(os.getenv("ARDUINO_BAUD", "9600"))
 VALID_MOVES = {"FORWARD", "LEFT", "RIGHT", "BACKWARD", "STOP"}
 DEFAULT_SAFE_MOVE = "STOP"
 
-# Gemini movement decisions are rate-limited so you do not call the API every frame.
+# Gemini Robotics movement decisions are rate-limited so you do not call the API every frame.
 USE_GEMINI_MOVEMENT = os.getenv("USE_GEMINI_MOVEMENT", "1") == "1"
 GEMINI_MOVE_INTERVAL_SECONDS = float(os.getenv("GEMINI_MOVE_INTERVAL_SECONDS", "2.0"))
 
@@ -71,8 +74,8 @@ SHOW_PREVIEW = os.getenv("SHOW_PREVIEW", "1") == "1"
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.45"))
 DETECTION_COOLDOWN_SECONDS = float(os.getenv("DETECTION_COOLDOWN_SECONDS", "20.0"))
 
-# Movement tuning. This script rotates to center a detected person, but it does
-# not drive forward toward them by default.
+# Movement tuning. This script rotates to center a detected person,
+# but it does not drive forward toward them by default.
 CENTER_TOLERANCE_PIXELS = int(os.getenv("CENTER_TOLERANCE_PIXELS", "80"))
 TOO_CLOSE_BODY_HEIGHT_RATIO = float(os.getenv("TOO_CLOSE_BODY_HEIGHT_RATIO", "0.82"))
 
@@ -145,6 +148,17 @@ def detect_body_parts_from_pose(result):
     keypoints = result.keypoints.data.cpu().numpy()
 
     for person_kpts in keypoints:
+        # COCO keypoints:
+        # 0 nose
+        # 1 left eye, 2 right eye
+        # 3 left ear, 4 right ear
+        # 5 left shoulder, 6 right shoulder
+        # 7 left elbow, 8 right elbow
+        # 9 left wrist, 10 right wrist
+        # 11 left hip, 12 right hip
+        # 13 left knee, 14 right knee
+        # 15 left ankle, 16 right ankle
+
         if any(keypoint_visible(person_kpts, i) for i in [0, 1, 2, 3, 4]):
             detected.add("face")
 
@@ -161,6 +175,7 @@ def detect_body_parts_from_pose(result):
         if any(keypoint_visible(person_kpts, i) for i in [11, 12, 13, 14, 15, 16]):
             detected.add("leg")
 
+        # COCO pose does not have toe/foot points; ankle is used as a foot proxy.
         if keypoint_visible(person_kpts, 15) or keypoint_visible(person_kpts, 16):
             detected.add("foot")
 
@@ -234,13 +249,15 @@ def local_movement_from_pose(result):
 
 
 # =========================
-# Gemini movement reasoning
+# Gemini Robotics movement reasoning
 # =========================
 
 def encode_frame_as_jpeg_bytes(frame):
     ok, buffer = cv2.imencode(".jpg", frame)
+
     if not ok:
         return None
+
     return buffer.tobytes()
 
 
@@ -284,7 +301,7 @@ Safety rules:
 
     try:
         response = client.models.generate_content(
-            model=GEMINI_MODEL,
+            model=ROBOTICS_MODEL,
             contents=[
                 prompt,
                 types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
@@ -398,7 +415,7 @@ def generate_first_question(client, body_part):
         )
 
     response = client.models.generate_content(
-        model=GEMINI_MODEL,
+        model=TEXT_MODEL,
         contents=[prompt],
     )
 
@@ -407,7 +424,7 @@ def generate_first_question(client, body_part):
 
 def transcribe_answer(client, wav_bytes):
     response = client.models.generate_content(
-        model=GEMINI_MODEL,
+        model=TEXT_MODEL,
         contents=[
             (
                 "Transcribe only the main clear user answer. "
@@ -428,7 +445,7 @@ def classify_user_status(client, transcript, memory):
     conversation_so_far = format_memory(memory)
 
     response = client.models.generate_content(
-        model=GEMINI_MODEL,
+        model=TEXT_MODEL,
         contents=[
             (
                 "Classify the person's latest answer into exactly one label.\n\n"
@@ -478,7 +495,7 @@ def generate_followup(client, transcript, memory):
         )
 
     response = client.models.generate_content(
-        model=GEMINI_MODEL,
+        model=TEXT_MODEL,
         contents=[prompt],
     )
 
@@ -503,7 +520,7 @@ def generate_help_response(client, transcript, memory):
     )
 
     response = client.models.generate_content(
-        model=GEMINI_MODEL,
+        model=TEXT_MODEL,
         contents=[prompt],
     )
 
@@ -665,7 +682,11 @@ async def run_conversation(gemini_client, body_part):
 async def continuous_camera_loop(gemini_client, arduino):
     print("Detector loop started. Camera will stay on until you quit.")
 
-    cap_backend = cv2.CAP_AVFOUNDATION if os.name == "posix" and sys_platform_is_macos() else cv2.CAP_ANY
+    if sys.platform == "darwin":
+        cap_backend = cv2.CAP_AVFOUNDATION
+    else:
+        cap_backend = cv2.CAP_ANY
+
     cap = cv2.VideoCapture(CAMERA_INDEX, cap_backend)
 
     if not cap.isOpened():
@@ -679,6 +700,7 @@ async def continuous_camera_loop(gemini_client, arduino):
 
     conversation_task = None
     movement_task = None
+
     last_gemini_move_time = 0.0
     last_sent_command = None
     last_sent_time = 0.0
@@ -708,6 +730,7 @@ async def continuous_camera_loop(gemini_client, arduino):
             local_command = local_movement_from_pose(result)
             now = time.monotonic()
 
+            # Clean up finished conversation task.
             if conversation_task is not None and conversation_task.done():
                 try:
                     conversation_task.result()
@@ -715,6 +738,7 @@ async def continuous_camera_loop(gemini_client, arduino):
                     print(f"Conversation task ended with error: {exc}")
                 conversation_task = None
 
+            # Detect newly visible body part to trigger a conversation.
             chosen_part = None
 
             for part in priority_parts:
@@ -730,6 +754,7 @@ async def continuous_camera_loop(gemini_client, arduino):
 
             active_parts = detected_parts
 
+            # Start a background conversation without stopping the camera.
             if chosen_part and conversation_task is None:
                 print(f"\nLocal detector: START_CONVERSATION: {chosen_part}")
 
@@ -741,10 +766,12 @@ async def continuous_camera_loop(gemini_client, arduino):
                     run_conversation(gemini_client, chosen_part)
                 )
 
+            # Movement control.
             if detected_parts:
                 current_command = local_command
 
                 if USE_GEMINI_MOVEMENT:
+                    # Collect completed Gemini movement result.
                     if movement_task is not None and movement_task.done():
                         try:
                             current_command = movement_task.result()
@@ -753,6 +780,7 @@ async def continuous_camera_loop(gemini_client, arduino):
                             current_command = local_command
                         movement_task = None
 
+                    # Start new Gemini Robotics movement decision at a safe interval.
                     if (
                         movement_task is None
                         and now - last_gemini_move_time >= GEMINI_MOVE_INTERVAL_SECONDS
@@ -773,10 +801,13 @@ async def continuous_camera_loop(gemini_client, arduino):
             else:
                 current_command = "STOP"
 
+            # Extra safety: while talking to a person, do not move forward/backward.
+            # Rotation is still allowed for camera centering.
             if conversation_task is not None and not conversation_task.done():
                 if current_command in {"FORWARD", "BACKWARD"}:
                     current_command = "STOP"
 
+            # Send movement command to Arduino.
             if (
                 current_command != last_sent_command
                 or now - last_sent_time >= MOVEMENT_COMMAND_INTERVAL_SECONDS
@@ -785,10 +816,12 @@ async def continuous_camera_loop(gemini_client, arduino):
                 last_sent_command = current_command
                 last_sent_time = now
 
+            # Preview window.
             if SHOW_PREVIEW:
                 annotated = result.plot()
 
                 label = ", ".join(sorted(detected_parts)) or "none"
+
                 cv2.putText(
                     annotated,
                     f"Detected: {label}",
@@ -798,6 +831,7 @@ async def continuous_camera_loop(gemini_client, arduino):
                     (255, 255, 255),
                     2,
                 )
+
                 cv2.putText(
                     annotated,
                     f"Move: {current_command}",
@@ -807,6 +841,7 @@ async def continuous_camera_loop(gemini_client, arduino):
                     (255, 255, 255),
                     2,
                 )
+
                 cv2.putText(
                     annotated,
                     f"Conversation: {'ON' if conversation_task else 'OFF'}",
@@ -839,18 +874,14 @@ async def continuous_camera_loop(gemini_client, arduino):
             cv2.destroyAllWindows()
 
 
-def sys_platform_is_macos():
-    import sys
-    return sys.platform == "darwin"
-
-
 # =========================
 # Main
 # =========================
 
 async def main():
     print("Starting assistive vision prototype with continuous camera + Arduino movement...")
-    print(f"Gemini model: {GEMINI_MODEL}")
+    print(f"Text model: {TEXT_MODEL}")
+    print(f"Robotics model: {ROBOTICS_MODEL}")
 
     gemini_client = genai.Client()
     arduino = open_arduino()
@@ -859,6 +890,7 @@ async def main():
         await continuous_camera_loop(gemini_client, arduino)
     finally:
         send_move(arduino, "STOP")
+
         if arduino is not None:
             try:
                 arduino.close()
