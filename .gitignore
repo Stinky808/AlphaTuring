@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+runs/
+images/VictimDet/
+trainingImages/
+yolo11n.pt
+yolo26n.pt
+VictimDet_Colab.ipynb
+images.zip
+split_dataset.py
+YOLOmodel.py

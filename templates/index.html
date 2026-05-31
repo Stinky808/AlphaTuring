@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VictimDet - Live Detection</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: #0a0a0a;
+            color: #fff;
+            font-family: 'Segoe UI', sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            padding: 24px;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 24px;
+        }
+
+        header h1 {
+            font-size: 2rem;
+            letter-spacing: 2px;
+            color: #ff4444;
+        }
+
+        header p {
+            color: #888;
+            margin-top: 4px;
+            font-size: 0.9rem;
+        }
+
+        .feed-container {
+            border: 2px solid #222;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 0 40px rgba(255, 68, 68, 0.15);
+        }
+
+        .feed-container img {
+            display: block;
+            max-width: 100%;
+            width: 800px;
+        }
+
+        .status {
+            margin-top: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #888;
+            font-size: 0.85rem;
+        }
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #44ff88;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        #alert-banner {
+            display: none;
+            margin-top: 16px;
+            padding: 12px 24px;
+            background: #ff4444;
+            border-radius: 8px;
+            font-weight: bold;
+            font-size: 1rem;
+            letter-spacing: 1px;
+            animation: flash 0.5s infinite alternate;
+        }
+
+        @keyframes flash {
+            from { opacity: 1; }
+            to { opacity: 0.5; }
+        }
+
+        #map {
+            margin-top: 24px;
+            width: 800px;
+            height: 400px;
+            border-radius: 8px;
+            border: 2px solid #222;
+            display: none;
+        }
+
+        #map-label {
+            margin-top: 8px;
+            color: #888;
+            font-size: 0.85rem;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>VictimDet</h1>
+        <p>Live victim detection feed</p>
+    </header>
+
+    <div class="feed-container">
+        <img src="/video_feed" alt="Live Feed">
+    </div>
+
+    <div class="status">
+        <div class="dot"></div>
+        <span>Live — bounding boxes and confidence scores rendered by YOLOv11</span>
+    </div>
+
+    <div id="alert-banner">VICTIM DETECTED</div>
+
+    <div id="map"></div>
+    <div id="map-label">Pinned detection locations</div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        let map = null;
+        let lastPinTime = 0;
+        const PIN_COOLDOWN_MS = 10000;
+
+        function initMap(lat, lng) {
+            if (map) return;
+            document.getElementById("map").style.display = "block";
+            document.getElementById("map-label").style.display = "block";
+            map = L.map("map").setView([lat, lng], 16);
+            L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+                attribution: "© OpenStreetMap contributors"
+            }).addTo(map);
+        }
+
+        function pinLocation(lat, lng) {
+            const now = Date.now();
+            if (now - lastPinTime < PIN_COOLDOWN_MS) return;
+            lastPinTime = now;
+
+            initMap(lat, lng);
+
+            const time = new Date().toLocaleTimeString();
+            L.marker([lat, lng])
+                .addTo(map)
+                .bindPopup(`Victim detected at ${time}`)
+                .openPopup();
+        }
+
+        function requestLocation() {
+            if (!navigator.geolocation) return;
+            navigator.geolocation.getCurrentPosition(pos => {
+                pinLocation(pos.coords.latitude, pos.coords.longitude);
+            });
+        }
+
+        let wasDetected = false;
+
+        async function poll() {
+            try {
+                const res = await fetch("/status");
+                const data = await res.json();
+                const banner = document.getElementById("alert-banner");
+
+                if (data.detected) {
+                    banner.style.display = "block";
+                    if (!wasDetected) requestLocation();
+                } else {
+                    banner.style.display = "none";
+                }
+
+                wasDetected = data.detected;
+            } catch (e) {}
+
+            setTimeout(poll, 1000);
+        }
+
+        poll();
+    </script>
+</body>
+</html>
