@@ -358,7 +358,7 @@ def generate_followup(client, transcript, memory):
             "You are a calm assistive safety assistant.\n\n"
             f"Conversation memory:\n{conversation_so_far}\n\n"
             f"The person just answered: {transcript}\n\n"
-            "Respond with one short supportive sentence, then ask one short follow-up safety question. "
+            "Respond with one short supportive sentence, then ask one short follow-up safety question. Also provide a safety tip catered to their situation."
             "Use the conversation memory so you do not repeat the same question unnecessarily. "
             "Say help is on the way."
         )
@@ -381,6 +381,7 @@ def generate_help_response(client, transcript, memory):
         f"The person just said: {transcript}\n\n"
         "Write a brief spoken response. "
         "Be calm and supportive. "
+        "Provide a safety tip catered to their situation."
         "Say help is on the way. "
         "Use the conversation memory so you do not repeat yourself. "
         "Then ask one short question to understand what help they need next. "
