@@ -11,6 +11,11 @@ import pyaudio
 import requests
 from ultralytics import YOLO
 
+try:
+    import serial
+except ImportError:
+    serial = None
+
 from google import genai
 from google.genai import types
 
@@ -19,28 +24,57 @@ from google.genai import types
 # Models / API config
 # =========================
 
-GEMINI_MODEL = "gemini-3.5-flash"
+# Gemini Robotics-ER runs on this computer/Raspberry Pi, not on the Arduino.
+# If your account does not have access to this preview model, temporarily set this
+# to a model you can use, such as "gemini-2.5-flash".
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-robotics-er-1.6-preview")
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
+ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
 
-ELEVENLABS_MODEL_ID = "eleven_multilingual_v2"
+
+# =========================
+# Arduino movement config
+# =========================
+
+# Set ARDUINO_PORT in your terminal before running, for example:
+#   macOS:  export ARDUINO_PORT=/dev/cu.usbmodem1101
+#   Linux:  export ARDUINO_PORT=/dev/ttyACM0
+#   Windows: set ARDUINO_PORT=COM3
+ARDUINO_PORT = os.getenv("ARDUINO_PORT", "")
+ARDUINO_BAUD = int(os.getenv("ARDUINO_BAUD", "9600"))
+
+VALID_MOVES = {"FORWARD", "LEFT", "RIGHT", "BACKWARD", "STOP"}
+DEFAULT_SAFE_MOVE = "STOP"
+
+# Gemini movement decisions are rate-limited so you do not call the API every frame.
+USE_GEMINI_MOVEMENT = os.getenv("USE_GEMINI_MOVEMENT", "1") == "1"
+GEMINI_MOVE_INTERVAL_SECONDS = float(os.getenv("GEMINI_MOVE_INTERVAL_SECONDS", "2.0"))
+
+# Local command throttle.
+MOVEMENT_COMMAND_INTERVAL_SECONDS = float(os.getenv("MOVEMENT_COMMAND_INTERVAL_SECONDS", "0.20"))
 
 
 # =========================
 # Camera / detection config
 # =========================
 
-CAMERA_INDEX = 0
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 480
+CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
+FRAME_WIDTH = int(os.getenv("FRAME_WIDTH", "640"))
+FRAME_HEIGHT = int(os.getenv("FRAME_HEIGHT", "480"))
 
-POSE_MODEL = "yolo11n-pose.pt"
+POSE_MODEL = os.getenv("POSE_MODEL", "yolo11n-pose.pt")
 
-SHOW_PREVIEW = True
+SHOW_PREVIEW = os.getenv("SHOW_PREVIEW", "1") == "1"
 
-CONFIDENCE_THRESHOLD = 0.45
-DETECTION_COOLDOWN_SECONDS = 20.0
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.45"))
+DETECTION_COOLDOWN_SECONDS = float(os.getenv("DETECTION_COOLDOWN_SECONDS", "20.0"))
+
+# Movement tuning. This script rotates to center a detected person, but it does
+# not drive forward toward them by default.
+CENTER_TOLERANCE_PIXELS = int(os.getenv("CENTER_TOLERANCE_PIXELS", "80"))
+TOO_CLOSE_BODY_HEIGHT_RATIO = float(os.getenv("TOO_CLOSE_BODY_HEIGHT_RATIO", "0.82"))
 
 
 # =========================
@@ -51,6 +85,47 @@ AUDIO_RATE = 16000
 AUDIO_CHANNELS = 1
 AUDIO_CHUNK = 512
 LISTEN_SECONDS = 7
+
+
+# =========================
+# Arduino helpers
+# =========================
+
+def open_arduino():
+    if not ARDUINO_PORT:
+        print("Arduino serial disabled. Set ARDUINO_PORT to enable movement output.")
+        return None
+
+    if serial is None:
+        print("pyserial is not installed. Run: pip install pyserial")
+        return None
+
+    try:
+        arduino = serial.Serial(ARDUINO_PORT, ARDUINO_BAUD, timeout=1)
+        time.sleep(2)
+        print(f"Arduino connected on {ARDUINO_PORT} at {ARDUINO_BAUD} baud.")
+        return arduino
+    except Exception as exc:
+        print(f"Could not open Arduino on {ARDUINO_PORT}: {exc}")
+        print("Continuing without Arduino movement output.")
+        return None
+
+
+def send_move(arduino, command):
+    command = (command or DEFAULT_SAFE_MOVE).strip().upper()
+
+    if command not in VALID_MOVES:
+        command = DEFAULT_SAFE_MOVE
+
+    print(f"Arduino command: {command}")
+
+    if arduino is None:
+        return
+
+    try:
+        arduino.write((command + "\n").encode("utf-8"))
+    except Exception as exc:
+        print(f"Failed to send Arduino command: {exc}")
 
 
 # =========================
@@ -70,17 +145,6 @@ def detect_body_parts_from_pose(result):
     keypoints = result.keypoints.data.cpu().numpy()
 
     for person_kpts in keypoints:
-        # COCO keypoints:
-        # 0 nose
-        # 1 left eye, 2 right eye
-        # 3 left ear, 4 right ear
-        # 5 left shoulder, 6 right shoulder
-        # 7 left elbow, 8 right elbow
-        # 9 left wrist, 10 right wrist
-        # 11 left hip, 12 right hip
-        # 13 left knee, 14 right knee
-        # 15 left ankle, 16 right ankle
-
         if any(keypoint_visible(person_kpts, i) for i in [0, 1, 2, 3, 4]):
             detected.add("face")
 
@@ -97,93 +161,145 @@ def detect_body_parts_from_pose(result):
         if any(keypoint_visible(person_kpts, i) for i in [11, 12, 13, 14, 15, 16]):
             detected.add("leg")
 
-        # COCO pose does not have toe/foot points; ankle is used as a foot proxy.
         if keypoint_visible(person_kpts, 15) or keypoint_visible(person_kpts, 16):
             detected.add("foot")
 
     return detected
 
 
-async def wait_for_first_body_part():
-    print("Detector loop started...")
+def estimate_person_position(result):
+    """
+    Returns approximate person center and height in pixels.
+    Uses visible YOLO pose keypoints.
+    """
+    if result.keypoints is None or result.keypoints.data is None:
+        return None
 
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_AVFOUNDATION)
+    keypoints = result.keypoints.data.cpu().numpy()
+    best = None
+    best_visible_count = 0
 
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open webcam at CAMERA_INDEX={CAMERA_INDEX}")
+    for person_kpts in keypoints:
+        visible_points = [
+            (float(kpt[0]), float(kpt[1]))
+            for kpt in person_kpts
+            if float(kpt[2]) >= CONFIDENCE_THRESHOLD
+        ]
 
-    model = YOLO(POSE_MODEL)
+        if len(visible_points) > best_visible_count:
+            best_visible_count = len(visible_points)
+            best = visible_points
 
-    active_parts = set()
-    last_announced = {}
+    if not best:
+        return None
 
-    priority_parts = ["hand", "arm", "leg", "foot", "face", "torso"]
+    xs = [pt[0] for pt in best]
+    ys = [pt[1] for pt in best]
+
+    x_min = min(xs)
+    x_max = max(xs)
+    y_min = min(ys)
+    y_max = max(ys)
+
+    return {
+        "center_x": (x_min + x_max) / 2.0,
+        "center_y": (y_min + y_max) / 2.0,
+        "height": y_max - y_min,
+        "visible_points": best_visible_count,
+    }
+
+
+def local_movement_from_pose(result):
+    """
+    Fast local fallback. It keeps the person centered by rotating left/right.
+    It does not drive forward toward the person by default.
+    """
+    position = estimate_person_position(result)
+
+    if position is None:
+        return "STOP"
+
+    if position["height"] >= FRAME_HEIGHT * TOO_CLOSE_BODY_HEIGHT_RATIO:
+        return "STOP"
+
+    frame_center_x = FRAME_WIDTH / 2.0
+
+    if position["center_x"] < frame_center_x - CENTER_TOLERANCE_PIXELS:
+        return "LEFT"
+
+    if position["center_x"] > frame_center_x + CENTER_TOLERANCE_PIXELS:
+        return "RIGHT"
+
+    return "STOP"
+
+
+# =========================
+# Gemini movement reasoning
+# =========================
+
+def encode_frame_as_jpeg_bytes(frame):
+    ok, buffer = cv2.imencode(".jpg", frame)
+    if not ok:
+        return None
+    return buffer.tobytes()
+
+
+def decide_robot_movement(client, frame, detected_parts, local_suggestion):
+    """
+    Uses Gemini Robotics-ER for high-level movement choice.
+    The output is constrained to a tiny command set for Arduino safety.
+    """
+    image_bytes = encode_frame_as_jpeg_bytes(frame)
+
+    if image_bytes is None:
+        return "STOP"
+
+    prompt = f"""
+You are controlling a small Arduino robot through serial text commands.
+
+Goal:
+Keep a visible person safely in camera view for assistive monitoring.
+
+Detected body parts from local YOLO pose detector:
+{", ".join(sorted(detected_parts)) if detected_parts else "none"}
+
+Fast local controller suggestion:
+{local_suggestion}
+
+Choose exactly one movement command:
+FORWARD
+LEFT
+RIGHT
+BACKWARD
+STOP
+
+Safety rules:
+- Prefer STOP when uncertain.
+- STOP if the person appears close.
+- Do not chase, bump, or touch a person.
+- Use LEFT or RIGHT only to gently rotate and keep the person centered.
+- Avoid FORWARD unless clearly safe and necessary.
+- Return only the command. No punctuation. No explanation.
+""".strip()
 
     try:
-        while True:
-            ret, frame = await asyncio.to_thread(cap.read)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                prompt,
+                types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+            ],
+        )
+    except Exception as exc:
+        print(f"Gemini movement decision failed: {exc}")
+        return local_suggestion if local_suggestion in VALID_MOVES else "STOP"
 
-            if not ret:
-                print("Could not read webcam frame")
-                await asyncio.sleep(1)
-                continue
+    command = (response.text or "").strip().upper()
 
-            frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+    if command not in VALID_MOVES:
+        return "STOP"
 
-            results = await asyncio.to_thread(
-                model.predict,
-                frame,
-                verbose=False,
-                conf=0.35,
-            )
-
-            result = results[0]
-            detected_parts = detect_body_parts_from_pose(result)
-            now = time.monotonic()
-
-            chosen_part = None
-
-            for part in priority_parts:
-                newly_visible = part in detected_parts and part not in active_parts
-                cooldown_ok = (
-                    now - last_announced.get(part, 0)
-                ) >= DETECTION_COOLDOWN_SECONDS
-
-                if newly_visible and cooldown_ok:
-                    chosen_part = part
-                    break
-
-            active_parts = detected_parts
-
-            if SHOW_PREVIEW:
-                annotated = result.plot()
-
-                label = ", ".join(sorted(detected_parts)) or "none"
-                cv2.putText(
-                    annotated,
-                    f"Detected: {label}",
-                    (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
-                    (255, 255, 255),
-                    2,
-                )
-
-                cv2.imshow("Body-Part Detector", annotated)
-
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    raise KeyboardInterrupt
-
-            if chosen_part:
-                print(f"\nLocal detector: START_CONVERSATION: {chosen_part}")
-                return chosen_part
-
-            await asyncio.sleep(0.03)
-
-    finally:
-        cap.release()
-        if SHOW_PREVIEW:
-            cv2.destroyAllWindows()
+    return command
 
 
 # =========================
@@ -355,7 +471,8 @@ def generate_followup(client, transcript, memory):
             "You are a calm assistive safety assistant.\n\n"
             f"Conversation memory:\n{conversation_so_far}\n\n"
             f"The person just answered: {transcript}\n\n"
-            "Respond with one short supportive sentence, then ask one short follow-up safety question. Also provide a safety tip catered to their situation."
+            "Respond with one short supportive sentence, then ask one short follow-up safety question. "
+            "Also provide a safety tip catered to their situation. "
             "Use the conversation memory so you do not repeat the same question unnecessarily. "
             "Say help is on the way."
         )
@@ -378,7 +495,7 @@ def generate_help_response(client, transcript, memory):
         f"The person just said: {transcript}\n\n"
         "Write a brief spoken response. "
         "Be calm and supportive. "
-        "Provide a safety tip catered to their situation."
+        "Provide a safety tip catered to their situation. "
         "Say help is on the way. "
         "Use the conversation memory so you do not repeat yourself. "
         "Then ask one short question to understand what help they need next. "
@@ -456,102 +573,297 @@ def speak_with_elevenlabs(text):
 
 
 # =========================
-# Main conversation
+# Conversation task
+# =========================
+
+async def run_conversation(gemini_client, body_part):
+    """
+    Runs one conversation in the background while the camera loop continues.
+    Returns when the person is classified as OK, or if the task is cancelled.
+    """
+    conversation_memory = []
+
+    first_question = await asyncio.to_thread(
+        generate_first_question,
+        gemini_client,
+        body_part,
+    )
+
+    add_memory(conversation_memory, "assistant", first_question)
+
+    print(f"\nGemini first question: {first_question}")
+    await asyncio.to_thread(speak_with_elevenlabs, first_question)
+
+    while True:
+        wav_bytes = await record_answer_wav()
+
+        print("Transcribing answer...")
+
+        transcript = await asyncio.to_thread(
+            transcribe_answer,
+            gemini_client,
+            wav_bytes,
+        )
+
+        print(f"\nUser transcript: {transcript}")
+
+        add_memory(conversation_memory, "user", transcript)
+
+        status = await asyncio.to_thread(
+            classify_user_status,
+            gemini_client,
+            transcript,
+            conversation_memory,
+        )
+
+        print(f"\nUser status: {status}")
+
+        if status == "OK":
+            reset_message = (
+                "I’m glad you’re okay. I’ll keep monitoring for anyone else who may need help."
+            )
+
+            add_memory(conversation_memory, "assistant", reset_message)
+
+            print(f"\nAssistant reset message: {reset_message}")
+            await asyncio.to_thread(speak_with_elevenlabs, reset_message)
+            return
+
+        if status == "NEEDS_HELP":
+            help_message = await asyncio.to_thread(
+                generate_help_response,
+                gemini_client,
+                transcript,
+                conversation_memory,
+            )
+
+            add_memory(conversation_memory, "assistant", help_message)
+
+            print(f"\nGemini help response: {help_message}")
+            await asyncio.to_thread(speak_with_elevenlabs, help_message)
+            continue
+
+        followup = await asyncio.to_thread(
+            generate_followup,
+            gemini_client,
+            transcript,
+            conversation_memory,
+        )
+
+        add_memory(conversation_memory, "assistant", followup)
+
+        print(f"\nGemini follow-up: {followup}")
+        await asyncio.to_thread(speak_with_elevenlabs, followup)
+
+        await asyncio.sleep(0.5)
+
+
+# =========================
+# Continuous camera / robot loop
+# =========================
+
+async def continuous_camera_loop(gemini_client, arduino):
+    print("Detector loop started. Camera will stay on until you quit.")
+
+    cap_backend = cv2.CAP_AVFOUNDATION if os.name == "posix" and sys_platform_is_macos() else cv2.CAP_ANY
+    cap = cv2.VideoCapture(CAMERA_INDEX, cap_backend)
+
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open webcam at CAMERA_INDEX={CAMERA_INDEX}")
+
+    model = YOLO(POSE_MODEL)
+
+    active_parts = set()
+    last_announced = {}
+    priority_parts = ["hand", "arm", "leg", "foot", "face", "torso"]
+
+    conversation_task = None
+    movement_task = None
+    last_gemini_move_time = 0.0
+    last_sent_command = None
+    last_sent_time = 0.0
+    current_command = "STOP"
+
+    try:
+        while True:
+            ret, frame = await asyncio.to_thread(cap.read)
+
+            if not ret:
+                print("Could not read webcam frame")
+                send_move(arduino, "STOP")
+                await asyncio.sleep(1)
+                continue
+
+            frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+
+            results = await asyncio.to_thread(
+                model.predict,
+                frame,
+                verbose=False,
+                conf=0.35,
+            )
+
+            result = results[0]
+            detected_parts = detect_body_parts_from_pose(result)
+            local_command = local_movement_from_pose(result)
+            now = time.monotonic()
+
+            if conversation_task is not None and conversation_task.done():
+                try:
+                    conversation_task.result()
+                except Exception as exc:
+                    print(f"Conversation task ended with error: {exc}")
+                conversation_task = None
+
+            chosen_part = None
+
+            for part in priority_parts:
+                newly_visible = part in detected_parts and part not in active_parts
+                cooldown_ok = (
+                    now - last_announced.get(part, 0)
+                ) >= DETECTION_COOLDOWN_SECONDS
+
+                if newly_visible and cooldown_ok:
+                    chosen_part = part
+                    last_announced[part] = now
+                    break
+
+            active_parts = detected_parts
+
+            if chosen_part and conversation_task is None:
+                print(f"\nLocal detector: START_CONVERSATION: {chosen_part}")
+
+                send_move(arduino, "STOP")
+                last_sent_command = "STOP"
+                last_sent_time = now
+
+                conversation_task = asyncio.create_task(
+                    run_conversation(gemini_client, chosen_part)
+                )
+
+            if detected_parts:
+                current_command = local_command
+
+                if USE_GEMINI_MOVEMENT:
+                    if movement_task is not None and movement_task.done():
+                        try:
+                            current_command = movement_task.result()
+                        except Exception as exc:
+                            print(f"Movement task ended with error: {exc}")
+                            current_command = local_command
+                        movement_task = None
+
+                    if (
+                        movement_task is None
+                        and now - last_gemini_move_time >= GEMINI_MOVE_INTERVAL_SECONDS
+                    ):
+                        last_gemini_move_time = now
+                        frame_for_gemini = frame.copy()
+                        parts_for_gemini = set(detected_parts)
+
+                        movement_task = asyncio.create_task(
+                            asyncio.to_thread(
+                                decide_robot_movement,
+                                gemini_client,
+                                frame_for_gemini,
+                                parts_for_gemini,
+                                local_command,
+                            )
+                        )
+            else:
+                current_command = "STOP"
+
+            if conversation_task is not None and not conversation_task.done():
+                if current_command in {"FORWARD", "BACKWARD"}:
+                    current_command = "STOP"
+
+            if (
+                current_command != last_sent_command
+                or now - last_sent_time >= MOVEMENT_COMMAND_INTERVAL_SECONDS
+            ):
+                send_move(arduino, current_command)
+                last_sent_command = current_command
+                last_sent_time = now
+
+            if SHOW_PREVIEW:
+                annotated = result.plot()
+
+                label = ", ".join(sorted(detected_parts)) or "none"
+                cv2.putText(
+                    annotated,
+                    f"Detected: {label}",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (255, 255, 255),
+                    2,
+                )
+                cv2.putText(
+                    annotated,
+                    f"Move: {current_command}",
+                    (20, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (255, 255, 255),
+                    2,
+                )
+                cv2.putText(
+                    annotated,
+                    f"Conversation: {'ON' if conversation_task else 'OFF'}",
+                    (20, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (255, 255, 255),
+                    2,
+                )
+
+                cv2.imshow("Body-Part Detector", annotated)
+
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    raise KeyboardInterrupt
+
+            await asyncio.sleep(0.03)
+
+    finally:
+        send_move(arduino, "STOP")
+
+        if conversation_task is not None and not conversation_task.done():
+            conversation_task.cancel()
+
+        if movement_task is not None and not movement_task.done():
+            movement_task.cancel()
+
+        cap.release()
+
+        if SHOW_PREVIEW:
+            cv2.destroyAllWindows()
+
+
+def sys_platform_is_macos():
+    import sys
+    return sys.platform == "darwin"
+
+
+# =========================
+# Main
 # =========================
 
 async def main():
-    print("Starting assistive vision prototype...")
+    print("Starting assistive vision prototype with continuous camera + Arduino movement...")
+    print(f"Gemini model: {GEMINI_MODEL}")
 
     gemini_client = genai.Client()
+    arduino = open_arduino()
 
-    while True:
-        print("\nScanning for visible body parts...")
-
-        # New session memory starts here.
-        # This resets whenever the previous user is classified as OK.
-        conversation_memory = []
-
-        body_part = await wait_for_first_body_part()
-
-        first_question = await asyncio.to_thread(
-            generate_first_question,
-            gemini_client,
-            body_part,
-        )
-
-        add_memory(conversation_memory, "assistant", first_question)
-
-        print(f"\nGemini first question: {first_question}")
-        await asyncio.to_thread(speak_with_elevenlabs, first_question)
-
-        while True:
-            wav_bytes = await record_answer_wav()
-
-            print("Transcribing answer...")
-
-            transcript = await asyncio.to_thread(
-                transcribe_answer,
-                gemini_client,
-                wav_bytes,
-            )
-
-            print(f"\nUser transcript: {transcript}")
-
-            add_memory(conversation_memory, "user", transcript)
-
-            status = await asyncio.to_thread(
-                classify_user_status,
-                gemini_client,
-                transcript,
-                conversation_memory,
-            )
-
-            print(f"\nUser status: {status}")
-
-            if status == "OK":
-                reset_message = (
-                    "I’m glad you’re okay. I’ll keep monitoring for anyone else who may need help."
-                )
-
-                add_memory(conversation_memory, "assistant", reset_message)
-
-                print(f"\nAssistant reset message: {reset_message}")
-                await asyncio.to_thread(speak_with_elevenlabs, reset_message)
-
-                # Reset memory by leaving this inner loop.
-                # The outer loop starts a fresh conversation_memory list.
-                conversation_memory = []
-                break
-
-            if status == "NEEDS_HELP":
-                help_message = await asyncio.to_thread(
-                    generate_help_response,
-                    gemini_client,
-                    transcript,
-                    conversation_memory,
-                )
-
-                add_memory(conversation_memory, "assistant", help_message)
-
-                print(f"\nGemini help response: {help_message}")
-                await asyncio.to_thread(speak_with_elevenlabs, help_message)
-
-                # Keep talking to the same person with memory preserved.
-                continue
-
-            followup = await asyncio.to_thread(
-                generate_followup,
-                gemini_client,
-                transcript,
-                conversation_memory,
-            )
-
-            add_memory(conversation_memory, "assistant", followup)
-
-            print(f"\nGemini follow-up: {followup}")
-            await asyncio.to_thread(speak_with_elevenlabs, followup)
-
-            await asyncio.sleep(0.5)
+    try:
+        await continuous_camera_loop(gemini_client, arduino)
+    finally:
+        send_move(arduino, "STOP")
+        if arduino is not None:
+            try:
+                arduino.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
