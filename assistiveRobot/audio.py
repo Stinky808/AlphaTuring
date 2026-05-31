@@ -21,11 +21,13 @@ from config import (
 def _suppress_alsa_errors():
     try:
         asound = ctypes.cdll.LoadLibrary("libasound.so.2")
-        handler = ctypes.CFUNCTYPE(
+        handler_type = ctypes.CFUNCTYPE(
             None, ctypes.c_char_p, ctypes.c_int,
             ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
         )
-        asound.snd_lib_error_set_handler(handler(lambda *_: None))
+        # Assign to function attribute — keeps it alive for the process lifetime
+        _suppress_alsa_errors._handler = handler_type(lambda *_: None)
+        asound.snd_lib_error_set_handler(_suppress_alsa_errors._handler)
     except Exception:
         pass
 
