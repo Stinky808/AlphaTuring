@@ -11,6 +11,7 @@ from config import (
     ELEVENLABS_MODEL_ID,
 )
 
+
 def speak_with_elevenlabs(text):
     if not ELEVENLABS_API_KEY:
         print("\nMissing ELEVENLABS_API_KEY. Printing instead of speaking.")
