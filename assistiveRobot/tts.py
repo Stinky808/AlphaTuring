@@ -1,6 +1,7 @@
 import os
 import subprocess
 import tempfile
+import sys
 
 import requests
 
@@ -61,7 +62,10 @@ def speak_with_elevenlabs(text):
     print(f"\nAssistant: {text}")
 
     try:
-        subprocess.run(["afplay", audio_path], check=False)
+        if sys.platform == "darwin":
+            subprocess.run(["afplay", audio_path], check=False)
+        else:
+            subprocess.run(["mpg123", "-q", audio_path], check=False)
 
     finally:
         try:
