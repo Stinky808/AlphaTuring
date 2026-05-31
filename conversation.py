@@ -1,6 +1,6 @@
 import asyncio
 
-from audio_io import record_answer_wav
+from audio import record_answer_wav
 from gemini_logic import (
     add_memory,
     generate_first_question,
