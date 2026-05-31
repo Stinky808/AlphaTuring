@@ -1,7 +1,7 @@
 from google.genai import types
 
 from config import TEXT_MODEL, ROBOTICS_MODEL, VALID_MOVES
-from vision import encode_frame_as_jpeg_bytes
+from camera import encode_frame_as_jpeg_bytes
 
 
 def generate_first_question(client, body_part):
