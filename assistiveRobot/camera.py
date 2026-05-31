@@ -9,6 +9,9 @@ from config import (
 )
 
 
+SEARCH_DIRECTION = "LEFT"
+
+
 def keypoint_visible(kpts, idx, threshold=CONFIDENCE_THRESHOLD):
     return kpts[idx][2] >= threshold
 
@@ -102,28 +105,37 @@ def estimate_person_position(result):
 
 def local_movement_from_pose(result):
     """
-    Fast local movement fallback.
+    Movement behavior:
+    - No person visible: rotate to search.
+    - Person left of center: rotate left.
+    - Person right of center: rotate right.
+    - Person centered: move forward.
+    - Person appears very close in camera: stop.
 
-    It rotates left/right to keep a person centered.
-    It does not drive forward toward the person by default.
+    The Arduino ultrasonic sensor should still block FORWARD if too close.
     """
     position = estimate_person_position(result)
 
+    # No person visible: search by slowly rotating.
     if position is None:
-        return "STOP"
+        return SEARCH_DIRECTION
 
+    # If the person looks very close in the camera, stop.
     if position["height"] >= FRAME_HEIGHT * TOO_CLOSE_BODY_HEIGHT_RATIO:
         return "STOP"
 
     frame_center_x = FRAME_WIDTH / 2.0
 
+    # Person is left of center, rotate left.
     if position["center_x"] < frame_center_x - CENTER_TOLERANCE_PIXELS:
         return "LEFT"
 
+    # Person is right of center, rotate right.
     if position["center_x"] > frame_center_x + CENTER_TOLERANCE_PIXELS:
         return "RIGHT"
 
-    return "STOP"
+    # Person is centered and not too close, approach.
+    return "FORWARD"
 
 
 def encode_frame_as_jpeg_bytes(frame):

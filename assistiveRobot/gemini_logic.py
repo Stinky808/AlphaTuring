@@ -141,21 +141,32 @@ def decide_robot_movement(client, frame, detected_parts, local_suggestion):
     """
     Uses Gemini Robotics-ER for high-level movement choice.
 
-    The output is constrained to a tiny command set for Arduino safety.
+    Behavior:
+    - Search when no person is visible.
+    - Turn toward a visible person.
+    - Approach when centered.
+    - Stop if close or uncertain.
+
+    The Arduino ultrasonic sensor is the final safety layer.
     """
     image_bytes = encode_frame_as_jpeg_bytes(frame)
 
     if image_bytes is None:
         return "STOP"
 
+    person_visible = bool(detected_parts)
+
     prompt = f"""
 You are controlling a small Arduino robot through serial text commands.
 
 Goal:
-Keep a visible person safely in camera view for assistive monitoring.
+Search for a person. When a person is visible, approach them slowly but do not get too close.
 
 Detected body parts from local YOLO pose detector:
 {", ".join(sorted(detected_parts)) if detected_parts else "none"}
+
+Person visible:
+{"yes" if person_visible else "no"}
 
 Fast local controller suggestion:
 {local_suggestion}
@@ -167,13 +178,18 @@ RIGHT
 BACKWARD
 STOP
 
-Safety rules:
-- Prefer STOP when uncertain.
-- STOP if the person appears close.
-- Do not chase, bump, or touch a person.
-- Use LEFT or RIGHT only to gently rotate and keep the person centered.
-- Avoid FORWARD unless clearly safe and necessary.
-- Return only the command. No punctuation. No explanation.
+Movement policy:
+- If no person is visible, choose LEFT or RIGHT to slowly search.
+- If a person is visible on the left side of the image, choose LEFT.
+- If a person is visible on the right side of the image, choose RIGHT.
+- If a person is visible and centered, choose FORWARD.
+- If the person appears very close, choose STOP.
+- If uncertain, choose STOP.
+- Do not use BACKWARD unless there is a clear reason.
+- The Arduino has an ultrasonic sensor and will block FORWARD if the robot is too close.
+
+Return only one word:
+FORWARD, LEFT, RIGHT, BACKWARD, or STOP.
 """.strip()
 
     try:

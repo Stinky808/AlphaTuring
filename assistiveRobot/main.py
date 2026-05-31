@@ -140,45 +140,58 @@ async def continuous_camera_loop(gemini_client, arduino):
                 )
 
             # Movement control.
-            if detected_parts:
-                current_command = local_command
+            #
+            # local_movement_from_pose() now handles both cases:
+            # - no person visible -> SEARCH_DIRECTION, usually LEFT
+            # - person visible -> LEFT / RIGHT / FORWARD / STOP
+            current_command = local_command
 
-                if USE_GEMINI_MOVEMENT:
-                    # Collect completed Gemini Robotics movement decision.
-                    if movement_task is not None and movement_task.done():
-                        try:
-                            current_command = movement_task.result()
-                        except Exception as exc:
-                            print(f"Movement task ended with error: {exc}")
+            if USE_GEMINI_MOVEMENT and detected_parts:
+                # Collect completed Gemini Robotics movement decision.
+                if movement_task is not None and movement_task.done():
+                    try:
+                        gemini_command = movement_task.result()
+
+                        # Only trust Gemini movement if a person is still visible.
+                        # This prevents an old delayed Gemini result from moving the robot
+                        # after the person disappears.
+                        if detected_parts:
+                            current_command = gemini_command
+                        else:
                             current_command = local_command
 
-                        movement_task = None
+                    except Exception as exc:
+                        print(f"Movement task ended with error: {exc}")
+                        current_command = local_command
 
-                    # Start a new movement decision at a safe interval.
-                    if (
-                        movement_task is None
-                        and now - last_gemini_move_time >= GEMINI_MOVE_INTERVAL_SECONDS
-                    ):
-                        last_gemini_move_time = now
+                    movement_task = None
 
-                        frame_for_gemini = frame.copy()
-                        parts_for_gemini = set(detected_parts)
+                # Start a new movement decision at a safe interval,
+                # but only when a person is visible.
+                if (
+                    movement_task is None
+                    and now - last_gemini_move_time >= GEMINI_MOVE_INTERVAL_SECONDS
+                ):
+                    last_gemini_move_time = now
 
-                        movement_task = asyncio.create_task(
-                            asyncio.to_thread(
-                                decide_robot_movement,
-                                gemini_client,
-                                frame_for_gemini,
-                                parts_for_gemini,
-                                local_command,
-                            )
+                    frame_for_gemini = frame.copy()
+                    parts_for_gemini = set(detected_parts)
+
+                    movement_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            decide_robot_movement,
+                            gemini_client,
+                            frame_for_gemini,
+                            parts_for_gemini,
+                            local_command,
                         )
-
-            else:
-                current_command = "STOP"
+                    )
 
             # Extra safety while speaking to a person:
             # do not drive forward/backward during conversation.
+            #
+            # This means the robot can search and approach before conversation,
+            # but once it starts talking, it will not keep driving toward the person.
             if conversation_task is not None and not conversation_task.done():
                 if current_command in {"FORWARD", "BACKWARD"}:
                     current_command = "STOP"
