@@ -1,7 +1,7 @@
-const int IN1 = 5;
-const int IN2 = 6;
-const int IN3 = 9;
-const int IN4 = 10;
+const int IN1 = 2;
+const int IN2 = 3;
+const int IN3 = 4;
+const int IN4 = 5;
 
 const int TRIG_PIN = 11;
 const int ECHO_PIN = 12;
